@@ -17,7 +17,7 @@ RUN pip3 install --no-cache-dir --upgrade pip && apt-get remove python3-pip --as
 RUN rm -rf /usr/bin/python
 RUN ln -s /usr/bin/python3 /usr/bin/python
 
-RUN git clone --recursive --depth 1 --branch v3.24.0  https://github.com/OpenNMT/CTranslate2.git
+RUN git clone --recursive --depth 1 --branch v3.20.0  https://github.com/OpenNMT/CTranslate2.git
 RUN rm /app/CTranslate2/CMakeLists.txt
 COPY CMakeLists-CTranslate2.txt CTranslate2/CMakeLists.txt
 RUN mkdir /app/CTranslate2/build
