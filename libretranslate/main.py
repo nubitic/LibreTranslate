@@ -36,6 +36,20 @@ def get_args():
         help="Storage URI to use for request limit data storage. See https://flask-limiter.readthedocs.io/en/stable/configuration.html. (%(default)s)",
     )
     parser.add_argument(
+        "--hourly-req-limit",
+        default=DEFARGS['HOURLY_REQ_LIMIT'],
+        type=int,
+        metavar="<number>",
+        help="Set the default maximum number of requests per hour per client, in addition to req-limit. (%(default)s)",
+    )
+    parser.add_argument(
+        "--hourly-req-limit-decay",
+        default=DEFARGS['HOURLY_REQ_LIMIT_DECAY'],
+        type=int,
+        metavar="<number>",
+        help="When used in combination with hourly-req-limit, adds additional hourly restrictions that logaritmically decrease for each additional hour. (%(default)s)",
+    )
+    parser.add_argument(
         "--daily-req-limit",
         default=DEFARGS['DAILY_REQ_LIMIT'],
         type=int,
@@ -48,6 +62,13 @@ def get_args():
         type=int,
         metavar="<number>",
         help="Set the maximum number of request limit offences that a client can exceed before being banned. (%(default)s)",
+    )
+    parser.add_argument(
+        "--req-time-cost",
+        default=DEFARGS['REQ_TIME_COST'],
+        type=int,
+        metavar="<number>",
+        help="Considers a time cost (in seconds) for request limiting purposes. If a request takes 10 seconds and this value is set to 5, the request cost is either 2 or the actual request cost (whichever is greater). (%(default)s)",
     )
     parser.add_argument(
         "--batch-limit",

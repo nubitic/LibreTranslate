@@ -1,4 +1,4 @@
-FROM python:3.10.10-slim-bullseye as builder
+FROM arm64v8/python:3.10.10-slim-bullseye as builder
 
 WORKDIR /app
 
@@ -19,7 +19,7 @@ RUN ./venv/bin/pip install Babel==2.12.1 && ./venv/bin/python scripts/compile_lo
   && ./venv/bin/pip install . \
   && ./venv/bin/pip cache purge
 
-FROM python:3.10.10-slim-bullseye
+FROM arm64v8/python:3.10.10-slim-bullseye
 
 ARG with_models=false
 ARG models=""
@@ -29,8 +29,6 @@ USER libretranslate
 
 COPY --from=builder --chown=1032:1032 /app /app
 WORKDIR /app
-
-COPY --from=builder --chown=1032:1032 /app/venv/bin/ltmanage /usr/bin/
 
 RUN if [ "$with_models" = "true" ]; then  \
   # initialize the language models

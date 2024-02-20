@@ -1,4 +1,5 @@
 import io
+import math
 import os
 import re
 import tempfile
@@ -89,21 +90,37 @@ def get_remote_address():
     return ip
 
 
-def get_req_limits(default_limit, api_keys_db, multiplier=1):
+def get_req_limits(default_limit, api_keys_db, db_multiplier=1, multiplier=1):
     req_limit = default_limit
 
     if api_keys_db:
         api_key = get_req_api_key()
 
         if api_key:
-            db_req_limit = api_keys_db.lookup(api_key)
-            if db_req_limit is not None:
-                req_limit = db_req_limit * multiplier
+            api_key_limits = api_keys_db.lookup(api_key)
+            if api_key_limits is not None:
+                req_limit = api_key_limits[0] * db_multiplier
 
-    return req_limit
+    return int(req_limit * multiplier)
 
 
-def get_routes_limits(default_req_limit, daily_req_limit, api_keys_db):
+def get_char_limit(default_limit, api_keys_db):
+    char_limit = default_limit
+
+    if api_keys_db:
+        api_key = get_req_api_key()
+
+        if api_key:
+            api_key_limits = api_keys_db.lookup(api_key)
+            if api_key_limits is not None:
+                if api_key_limits[1] is not None:
+                    char_limit = api_key_limits[1]
+
+    return char_limit
+
+
+def get_routes_limits(args, api_keys_db):
+    default_req_limit = args.req_limit
     if default_req_limit == -1:
         # TODO: better way?
         default_req_limit = 9999999999999
@@ -111,12 +128,22 @@ def get_routes_limits(default_req_limit, daily_req_limit, api_keys_db):
     def minute_limits():
         return "%s per minute" % get_req_limits(default_req_limit, api_keys_db)
 
+    def hourly_limits(n):
+        def func():
+          decay = (0.75 ** (n - 1))
+          return "{} per {} hour".format(get_req_limits(args.hourly_req_limit * n, api_keys_db, int(os.environ.get("LT_HOURLY_REQ_LIMIT_MULTIPLIER", 60) * n), decay), n)
+        return func
+
     def daily_limits():
-        return "%s per day" % get_req_limits(daily_req_limit, api_keys_db, 1440)
+        return "%s per day" % get_req_limits(args.daily_req_limit, api_keys_db, int(os.environ.get("LT_DAILY_REQ_LIMIT_MULTIPLIER", 1440)))
 
     res = [minute_limits]
 
-    if daily_req_limit > 0:
+    if args.hourly_req_limit > 0:
+      for n in range(1, args.hourly_req_limit_decay + 2):
+        res.append(hourly_limits(n))
+
+    if args.daily_req_limit > 0:
         res.append(daily_limits)
 
     return res
@@ -186,19 +213,28 @@ def create_app(args):
 
     api_keys_db = None
 
-    if args.req_limit > 0 or args.api_keys or args.daily_req_limit > 0:
+    if args.req_limit > 0 or args.api_keys or args.daily_req_limit > 0 or args.hourly_req_limit > 0:
         api_keys_db = None
         if args.api_keys:
             api_keys_db = RemoteDatabase(args.api_keys_remote) if args.api_keys_remote else Database(args.api_keys_db_path)
 
         from flask_limiter import Limiter
 
+        def limits_cost():
+          req_cost = getattr(request, 'req_cost', 1)
+          if args.req_time_cost > 0:
+            return max(req_cost, int(math.ceil(getattr(request, 'duration', 0) / args.req_time_cost)))
+          else:
+            return req_cost
+
         limiter = Limiter(
             key_func=get_remote_address,
             default_limits=get_routes_limits(
-                args.req_limit, args.daily_req_limit, api_keys_db
+                args, api_keys_db
             ),
             storage_uri=args.req_limit_storage,
+            default_limits_deduct_when=lambda req: True, # Force cost to be called after the request
+            default_limits_cost=limits_cost
         )
     else:
         from .no_limiter import Limiter
@@ -297,12 +333,19 @@ def create_app(args):
                 status = e.code
                 raise e
               finally:
-                duration = max(default_timer() - start_t, 0)
-                measure_request.labels(request.path, status, ip, ak).observe(duration)
+                request.duration = max(default_timer() - start_t, 0)
+                measure_request.labels(request.path, status, ip, ak).observe(request.duration)
                 g.dec()
           return measure_func
         else:
-          return func
+          @wraps(func)
+          def time_func(*a, **kw):
+            start_t = default_timer()
+            try:
+              return func(*a, **kw)
+            finally:
+              request.duration = max(default_timer() - start_t, 0)
+          return time_func
 
     @bp.errorhandler(400)
     def invalid_api(e):
@@ -534,6 +577,8 @@ def create_app(args):
             # https://www.rfc-editor.org/rfc/rfc2046#section-4.1.1
             q = "\n".join(q.splitlines())
 
+        char_limit = get_char_limit(args.char_limit, api_keys_db)
+
         batch = isinstance(q, list)
 
         if batch and args.batch_limit != -1:
@@ -544,43 +589,29 @@ def create_app(args):
                     description=_("Invalid request: request (%(size)s) exceeds text limit (%(limit)s)", size=batch_size, limit=args.batch_limit),
                 )
 
-        if args.char_limit != -1:
-            chars = sum([len(text) for text in q]) if batch else len(q)
+        src_texts = q if batch else [q]
 
-            if args.char_limit < chars:
-                abort(
-                    400,
-                    description=_("Invalid request: request (%(size)s) exceeds text limit (%(limit)s)", size=chars, limit=args.char_limit),
-                )
+        if char_limit != -1:
+            for text in src_texts:
+                if len(text) > char_limit:
+                    abort(
+                        400,
+                        description=_("Invalid request: request (%(size)s) exceeds text limit (%(limit)s)", size=len(text), limit=char_limit),
+                    )
+
+        if batch:
+            request.req_cost = max(1, len(q))
 
         if source_lang == "auto":
-            source_langs = []
-            auto_detect_texts = q if batch else [q]
-
-            overall_candidates = detect_languages(q)
-
-            for text_to_check in auto_detect_texts:
-                if len(text_to_check) > 40:
-                    candidate_langs = detect_languages(text_to_check)
-                else:
-                    # Unable to accurately detect languages for short texts
-                    candidate_langs = overall_candidates
-                source_langs.append(candidate_langs[0])
-
-                if args.debug:
-                    print(text_to_check, candidate_langs)
-                    print("Auto detected: %s" % candidate_langs[0]["language"])
+            candidate_langs = detect_languages(src_texts)
+            detected_src_lang = candidate_langs[0]
         else:
-            if batch:
-                source_langs = [ {"confidence": 100.0, "language": source_lang} for text in q]
-            else:
-                source_langs = [ {"confidence": 100.0, "language": source_lang} ]
+            detected_src_lang = {"confidence": 100.0, "language": source_lang}
 
-        src_langs = [next(iter([l for l in languages if l.code == source_lang["language"]]), None) for source_lang in source_langs]
+        src_lang = next(iter([l for l in languages if l.code == detected_src_lang["language"]]), None)
 
-        for idx, lang in enumerate(src_langs):
-            if lang is None:
-                abort(400, description=_("%(lang)s is not supported", lang=source_langs[idx]))
+        if src_lang is None:
+            abort(400, description=_("%(lang)s is not supported", lang=source_lang))
 
         tgt_lang = next(iter([l for l in languages if l.code == target_lang]), None)
 
@@ -596,10 +627,10 @@ def create_app(args):
         try:
             if batch:
                 results = []
-                for idx, text in enumerate(q):
-                    translator = src_langs[idx].get_translation(tgt_lang)
+                for text in q:
+                    translator = src_lang.get_translation(tgt_lang)
                     if translator is None:
-                        abort(400, description=_("%(tname)s (%(tcode)s) is not available as a target language from %(sname)s (%(scode)s)", tname=_lazy(tgt_lang.name), tcode=tgt_lang.code, sname=_lazy(src_langs[idx].name), scode=src_langs[idx].code))
+                        abort(400, description=_("%(tname)s (%(tcode)s) is not available as a target language from %(sname)s (%(scode)s)", tname=_lazy(tgt_lang.name), tcode=tgt_lang.code, sname=_lazy(src_lang.name), scode=src_lang.code))
 
                     if text_format == "html":
                         translated_text = str(translate_html(translator, text))
@@ -611,7 +642,7 @@ def create_app(args):
                     return jsonify(
                         {
                             "translatedText": results,
-                            "detectedLanguage": source_langs
+                            "detectedLanguage": [detected_src_lang] * len(q)
                         }
                     )
                 else:
@@ -621,9 +652,9 @@ def create_app(args):
                           }
                     )
             else:
-                translator = src_langs[0].get_translation(tgt_lang)
+                translator = src_lang.get_translation(tgt_lang)
                 if translator is None:
-                    abort(400, description=_("%(tname)s (%(tcode)s) is not available as a target language from %(sname)s (%(scode)s)", tname=_lazy(tgt_lang.name), tcode=tgt_lang.code, sname=_lazy(src_langs[0].name), scode=src_langs[0].code))
+                    abort(400, description=_("%(tname)s (%(tcode)s) is not available as a target language from %(sname)s (%(scode)s)", tname=_lazy(tgt_lang.name), tcode=tgt_lang.code, sname=_lazy(src_lang.name), scode=src_lang.code))
 
                 if text_format == "html":
                     translated_text = str(translate_html(translator, q))
@@ -634,7 +665,7 @@ def create_app(args):
                     return jsonify(
                         {
                             "translatedText": unescape(translated_text),
-                            "detectedLanguage": source_langs[0]
+                            "detectedLanguage": detected_src_lang
                         }
                     )
                 else:
@@ -644,6 +675,7 @@ def create_app(args):
                         }
                     )
         except Exception as e:
+            raise e
             abort(500, description=_("Cannot translate text: %(text)s", text=str(e)))
 
     @bp.post("/translate_file")
@@ -736,6 +768,7 @@ def create_app(args):
         source_lang = request.form.get("source")
         target_lang = request.form.get("target")
         file = request.files['file']
+        char_limit = get_char_limit(args.char_limit, api_keys_db)
 
         if not file:
             abort(400, description=_("Invalid request: missing %(name)s parameter", name='file'))
@@ -750,12 +783,10 @@ def create_app(args):
         if os.path.splitext(file.filename)[1] not in frontend_argos_supported_files_format:
             abort(400, description=_("Invalid request: file format not supported"))
 
-        source_langs = [source_lang]
-        src_langs = [next(iter([l for l in languages if l.code == source_lang]), None) for source_lang in source_langs]
+        src_lang = next(iter([l for l in languages if l.code == source_lang]), None)
 
-        for idx, lang in enumerate(src_langs):
-            if lang is None:
-                abort(400, description=_("%(lang)s is not supported", lang=source_langs[idx]))
+        if src_lang is None:
+            abort(400, description=_("%(lang)s is not supported", lang=source_lang))
 
         tgt_lang = next(iter([l for l in languages if l.code == target_lang]), None)
 
@@ -768,7 +799,15 @@ def create_app(args):
 
             file.save(filepath)
 
-            translated_file_path = argostranslatefiles.translate_file(src_langs[0].get_translation(tgt_lang), filepath)
+            # Not an exact science: take the number of bytes and divide by
+            # the character limit. Assuming a plain text file, this will
+            # set the cost of the request to N = bytes / char_limit, which is
+            # roughly equivalent to a batch process of N batches assuming
+            # each batch uses all available limits
+            if char_limit > 0:
+                request.req_cost = max(1, int(os.path.getsize(filepath) / char_limit))
+
+            translated_file_path = argostranslatefiles.translate_file(src_lang.get_translation(tgt_lang), filepath)
             translated_filename = os.path.basename(translated_file_path)
 
             return jsonify(
